@@ -25,10 +25,10 @@ from chunk_extractor import extract_chunks_batch, NounChunk
 
 # DATASET_NAME    = "Bosio/pacman_descriptions"
 DATASET_NAMES = [
-    "Salesforce/wikitext",
+    # "Salesforce/wikitext",
     "agentlans/high-quality-english-sentences",
 ]
-MAX_SENTENCES   = None
+MAX_SENTENCES   = 10_000
 MIN_CHUNK_LEN   = 3
 MAX_MODIFIERS   = 8
 
