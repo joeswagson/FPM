@@ -1,218 +1,144 @@
 """
 Noun Chunk Extractor
 ====================
-Parses sentences into (head_noun, [modifiers], full_chunk_text) triples.
+Streaming design — never holds more than SPACY_BATCH sentences in memory
+at once. Safe for multi-million sentence corpora.
 
-"a round fuzzy ball" → ("ball", ["round", "fuzzy"], "round fuzzy ball")
-"elastic waistband"  → ("waistband", ["elastic"], "elastic waistband")
-"zip-up front"       → ("front", ["zip-up"], "zip-up front")
-
-This is the stage that dissolves grammar into subject+operator pairs.
-Syntax is scaffolding — once we know which modifiers apply to which noun,
-the sentence structure is discarded.
+Core idea: sentences come in as any iterable (list, generator, file lines).
+The extractor slices them into small windows, runs spaCy on each window,
+yields the resulting NounChunk objects, then drops the window before
+loading the next one.
 """
 
 import spacy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Iterable, Iterator
+from tqdm import tqdm
 
-# Download: python -m spacy download en_core_web_sm
-nlp = spacy.load("en_core_web_sm",
-    disable=["ner", "textcat", "lemmatizer", "attribute_ruler"])
+# Disable components we don't need — saves ~40% memory and runs faster.
+# We only need the tokenizer, tagger, and dependency parser for noun chunks.
+nlp = spacy.load("en_core_web_sm", exclude=["ner", "lemmatizer"])
+nlp.max_length = 2_000_000  # allow long docs if a sentence is huge
 
 
 @dataclass
 class NounChunk:
-    head: str           # The head noun — this becomes the feature node
-    modifiers: list     # Adjectives/compounds — these become attribute operators
-    full_text: str      # The complete chunk text — used for embedding the target
-    source: str         # Original sentence, kept for debug/tracing
+    head: str
+    modifiers: list = field(default_factory=list)
+    full_text: str = ""
+    source: str = ""
 
 
-def extract_chunks(text: str) -> list[NounChunk]:
-    """
-    Extract all noun chunks from a sentence, splitting each into
-    head noun and its modifiers.
-
-    Compound modifiers (e.g. "zip-up") are kept as single tokens.
-    Articles (a, an, the) are filtered — they carry no attribute information.
-    """
-    doc = nlp(text)
+def _parse_doc(doc: spacy.tokens.Doc, source: str) -> list[NounChunk]:
+    """Extract NounChunk objects from a single parsed spaCy doc."""
     chunks = []
-
     for chunk in doc.noun_chunks:
-        head = chunk.root.lemma_.lower()
+        head = chunk.root.text.lower()  # skip lemmatizer — use raw text
+        if len(head) < 2:
+            continue
 
         modifiers = []
         for token in chunk:
-            # Skip the head noun itself, articles, punctuation
             if token == chunk.root:
                 continue
-            if token.pos_ in ("DET",):  # articles: a, an, the
+            if token.pos_ in ("DET", "PRON"):
                 continue
             if token.is_punct or token.is_space:
                 continue
-            # Keep adjectives, compounds, participial modifiers
-            if token.pos_ in ("ADJ", "NOUN", "VERB") or token.dep_ in ("amod", "compound", "npadvmod"):
+            if token.pos_ in ("ADJ", "NOUN", "VERB") or \
+               token.dep_ in ("amod", "compound", "npadvmod"):
                 modifiers.append(token.text.lower())
-
-        # Skip chunks that are just a bare pronoun or very short noise
-        if len(head) < 2:
-            continue
 
         chunks.append(NounChunk(
             head=head,
             modifiers=modifiers,
             full_text=chunk.text.lower().strip(),
-            source=text,
+            source=source,
         ))
-
     return chunks
 
-POS_KEEP = {"ADJ", "NOUN", "PROPN", "VERB"}
 
-def extract_chunks_stream(texts, batch_size=512, max_modifiers=8):
-    for doc in nlp.pipe(texts, batch_size=batch_size, n_process=4):
-        chunk = []
-
-        for token in doc:
-            if token.pos_ in POS_KEEP:
-                chunk.append(token)
-            else:
-                if chunk:
-                    # find head noun (rightmost NOUN/PROPN)
-                    head_token = None
-                    for t in reversed(chunk):
-                        if t.pos_ in {"NOUN", "PROPN"}:
-                            head_token = t
-                            break
-
-                    if head_token is not None:
-                        head = head_token.lemma_.lower()
-
-                        mods = [
-                            t.lemma_.lower()
-                            for t in chunk
-                            if t != head_token and t.is_alpha and len(t.lemma_) > 1
-                        ][:max_modifiers]
-
-                        if len(head) > 1:
-                            full = " ".join(t.lemma_.lower() for t in chunk)
-                            yield head, mods, full
-
-                chunk = []
-
-        # flush remaining chunk
-        if chunk:
-            head_token = None
-            for t in reversed(chunk):
-                if t.pos_ in {"NOUN", "PROPN"}:
-                    head_token = t
-                    break
-
-            if head_token is not None:
-                head = head_token.lemma_.lower()
-
-                mods = [
-                    t.lemma_.lower()
-                    for t in chunk
-                    if t != head_token and t.is_alpha and len(t.lemma_) > 1
-                ][:max_modifiers]
-
-                if len(head) > 1:
-                    full = " ".join(t.lemma_.lower() for t in chunk)
-                    yield head, mods, full
-
-def extract_chunks_batch_limit(texts, batch_size=512, max_modifiers=8):
+def stream_chunks(
+    sentences: Iterable[str],
+    spacy_batch: int = 512,    # sentences per spaCy pipe call — keep this small
+    max_modifiers: int = 4,
+    min_head_len: int = 2,
+    show_progress: bool = True,
+    total: int = None,         # optional: total sentence count for tqdm
+) -> Iterator[NounChunk]:
     """
-    Returns:
-        (head_lemma, [modifier_lemmas], full_chunk_lemmas)
+    Stream NounChunk objects from an iterable of sentences.
+
+    Memory behaviour: at any point only `spacy_batch` sentences + their
+    parsed docs exist in memory. Everything before the current window
+    has been yielded and released.
+
+    Args:
+        sentences:      Any iterable of sentence strings. Can be a generator.
+        spacy_batch:    Number of sentences processed per spaCy call.
+                        512 is safe for ~3GB RAM. Lower if you're tight.
+        max_modifiers:  Cap modifier count per chunk.
+        min_head_len:   Skip head nouns shorter than this.
+        show_progress:  Show a tqdm progress bar over sentences.
+        total:          Total sentence count hint for tqdm (optional).
     """
+    sentence_iter = iter(sentences)
+    if show_progress:
+        sentence_iter = tqdm(sentence_iter, total=total,
+                             desc="Parsing chunks", unit=" sent")
 
-    results = []
+    window = []
+    for sentence in sentence_iter:
+        window.append(sentence)
 
-    for doc in nlp.pipe(texts, batch_size=batch_size, n_process=1):
-        chunk_tokens = []
+        if len(window) >= spacy_batch:
+            # Process this window and immediately yield results
+            for doc, src in zip(nlp.pipe(window, batch_size=spacy_batch), window):
+                for chunk in _parse_doc(doc, src):
+                    chunk.modifiers = chunk.modifiers[:max_modifiers]
+                    if len(chunk.head) >= min_head_len:
+                        yield chunk
+            window = []  # drop references — GC can reclaim memory
 
-        for token in doc:
-            if token.pos_ in POS_KEEP:
-                chunk_tokens.append(token)
-            else:
-                if chunk_tokens:
-                    head_token = None
-                    for t in reversed(chunk_tokens):
-                        if t.pos_ in {"NOUN", "PROPN"}:
-                            head_token = t
-                            break
+    # Flush remaining sentences
+    if window:
+        for doc, src in zip(nlp.pipe(window, batch_size=spacy_batch), window):
+            for chunk in _parse_doc(doc, src):
+                chunk.modifiers = chunk.modifiers[:max_modifiers]
+                if len(chunk.head) >= min_head_len:
+                    yield chunk
 
-                    if head_token is not None:
-                        head = head_token.lemma_.lower()
 
-                        modifiers = [
-                            t.lemma_.lower()
-                            for t in chunk_tokens
-                            if t != head_token and t.is_alpha and len(t.lemma_) > 1
-                        ][:max_modifiers]
-
-                        if len(head) > 1:
-                            full = " ".join(t.lemma_.lower() for t in chunk_tokens)
-                            results.append((head, modifiers, full))
-
-                chunk_tokens = []
-
-        # flush
-        if chunk_tokens:
-            head_token = None
-            for t in reversed(chunk_tokens):
-                if t.pos_ in {"NOUN", "PROPN"}:
-                    head_token = t
-                    break
-
-            if head_token is not None:
-                head = head_token.lemma_.lower()
-
-                modifiers = [
-                    t.lemma_.lower()
-                    for t in chunk_tokens
-                    if t != head_token and t.is_alpha and len(t.lemma_) > 1
-                ][:max_modifiers]
-
-                if len(head) > 1:
-                    full = " ".join(t.lemma_.lower() for t in chunk_tokens)
-                    results.append((head, modifiers, full))
-
-    return results
-
-def extract_chunks_batch(texts: list[str], batch_size: int = 256) -> list[NounChunk]:
+def collect_chunks(
+    sentences: Iterable[str],
+    max_chunks: int = None,
+    spacy_batch: int = 512,
+    max_modifiers: int = 4,
+    min_head_len: int = 2,
+    show_progress: bool = True,
+    total: int = None,
+) -> list[NounChunk]:
     """
-    Batch extraction using spaCy's pipe for efficiency.
+    Convenience wrapper: collect stream_chunks into a list, with optional cap.
+    Use stream_chunks directly if you want to process without ever building
+    a full list (e.g., writing to disk as you go).
     """
-    all_chunks = []
-    for doc, text in zip(nlp.pipe(texts, batch_size=batch_size), texts):
-        for chunk in doc.noun_chunks:
-            head = chunk.root.lemma_.lower()
-            modifiers = []
-            for token in chunk:
-                if token == chunk.root:
-                    continue
-                if token.pos_ in ("DET",):
-                    continue
-                if token.is_punct or token.is_space:
-                    continue
-                if token.pos_ in ("ADJ", "NOUN", "VERB") or token.dep_ in ("amod", "compound", "npadvmod"):
-                    modifiers.append(token.text.lower())
-            if len(head) < 2:
-                continue
-            all_chunks.append(NounChunk(
-                head=head,
-                modifiers=modifiers,
-                full_text=chunk.text.lower().strip(),
-                source=text,
-            ))
-    return all_chunks
+    chunks = []
+    for chunk in stream_chunks(
+        sentences,
+        spacy_batch=spacy_batch,
+        max_modifiers=max_modifiers,
+        min_head_len=min_head_len,
+        show_progress=show_progress,
+        total=total,
+    ):
+        chunks.append(chunk)
+        if max_chunks and len(chunks) >= max_chunks:
+            break
+    return chunks
 
 
 if __name__ == "__main__":
-    # Quick sanity check
     tests = [
         "a round ball",
         "a round fuzzy ball",
@@ -220,9 +146,9 @@ if __name__ == "__main__":
         "Collared dress featuring sleeves below the elbow with cuffs and pleats.",
         "Midi dress with a lapel collar and crossover V-neckline, long sleeves.",
         "Oversized collared shirt with long cuffed sleeves.",
+        "The large elastic waistband sits comfortably on the hips.",
     ]
 
-    for text in tests:
-        print(f"\n'{text}'")
-        for head, mods in extract_chunks_batch_limit(text):
-            print(f"  head='{head}'  modifiers={mods}'")
+    print("Streaming extractor test:\n")
+    for chunk in stream_chunks(tests, spacy_batch=4, show_progress=False):
+        print(f"  head='{chunk.head}'  mods={chunk.modifiers:<35}  full='{chunk.full_text}'")
