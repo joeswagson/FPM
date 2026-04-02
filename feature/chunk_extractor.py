@@ -16,7 +16,8 @@ import spacy
 from dataclasses import dataclass
 
 # Download: python -m spacy download en_core_web_sm
-nlp = spacy.load("en_core_web_sm")
+nlp = spacy.load("en_core_web_sm",
+    disable=["ner", "textcat", "lemmatizer", "attribute_ruler"])
 
 
 @dataclass
@@ -67,6 +68,119 @@ def extract_chunks(text: str) -> list[NounChunk]:
 
     return chunks
 
+POS_KEEP = {"ADJ", "NOUN", "PROPN", "VERB"}
+
+def extract_chunks_stream(texts, batch_size=512, max_modifiers=8):
+    for doc in nlp.pipe(texts, batch_size=batch_size, n_process=4):
+        chunk = []
+
+        for token in doc:
+            if token.pos_ in POS_KEEP:
+                chunk.append(token)
+            else:
+                if chunk:
+                    # find head noun (rightmost NOUN/PROPN)
+                    head_token = None
+                    for t in reversed(chunk):
+                        if t.pos_ in {"NOUN", "PROPN"}:
+                            head_token = t
+                            break
+
+                    if head_token is not None:
+                        head = head_token.lemma_.lower()
+
+                        mods = [
+                            t.lemma_.lower()
+                            for t in chunk
+                            if t != head_token and t.is_alpha and len(t.lemma_) > 1
+                        ][:max_modifiers]
+
+                        if len(head) > 1:
+                            full = " ".join(t.lemma_.lower() for t in chunk)
+                            yield head, mods, full
+
+                chunk = []
+
+        # flush remaining chunk
+        if chunk:
+            head_token = None
+            for t in reversed(chunk):
+                if t.pos_ in {"NOUN", "PROPN"}:
+                    head_token = t
+                    break
+
+            if head_token is not None:
+                head = head_token.lemma_.lower()
+
+                mods = [
+                    t.lemma_.lower()
+                    for t in chunk
+                    if t != head_token and t.is_alpha and len(t.lemma_) > 1
+                ][:max_modifiers]
+
+                if len(head) > 1:
+                    full = " ".join(t.lemma_.lower() for t in chunk)
+                    yield head, mods, full
+
+def extract_chunks_batch_limit(texts, batch_size=512, max_modifiers=8):
+    """
+    Returns:
+        (head_lemma, [modifier_lemmas], full_chunk_lemmas)
+    """
+
+    results = []
+
+    for doc in nlp.pipe(texts, batch_size=batch_size, n_process=1):
+        chunk_tokens = []
+
+        for token in doc:
+            if token.pos_ in POS_KEEP:
+                chunk_tokens.append(token)
+            else:
+                if chunk_tokens:
+                    head_token = None
+                    for t in reversed(chunk_tokens):
+                        if t.pos_ in {"NOUN", "PROPN"}:
+                            head_token = t
+                            break
+
+                    if head_token is not None:
+                        head = head_token.lemma_.lower()
+
+                        modifiers = [
+                            t.lemma_.lower()
+                            for t in chunk_tokens
+                            if t != head_token and t.is_alpha and len(t.lemma_) > 1
+                        ][:max_modifiers]
+
+                        if len(head) > 1:
+                            full = " ".join(t.lemma_.lower() for t in chunk_tokens)
+                            results.append((head, modifiers, full))
+
+                chunk_tokens = []
+
+        # flush
+        if chunk_tokens:
+            head_token = None
+            for t in reversed(chunk_tokens):
+                if t.pos_ in {"NOUN", "PROPN"}:
+                    head_token = t
+                    break
+
+            if head_token is not None:
+                head = head_token.lemma_.lower()
+
+                modifiers = [
+                    t.lemma_.lower()
+                    for t in chunk_tokens
+                    if t != head_token and t.is_alpha and len(t.lemma_) > 1
+                ][:max_modifiers]
+
+                if len(head) > 1:
+                    full = " ".join(t.lemma_.lower() for t in chunk_tokens)
+                    results.append((head, modifiers, full))
+
+    return results
 
 def extract_chunks_batch(texts: list[str], batch_size: int = 256) -> list[NounChunk]:
     """
@@ -110,5 +224,5 @@ if __name__ == "__main__":
 
     for text in tests:
         print(f"\n'{text}'")
-        for chunk in extract_chunks(text):
-            print(f"  head='{chunk.head}'  modifiers={chunk.modifiers}  full='{chunk.full_text}'")
+        for head, mods in extract_chunks_batch_limit(text):
+            print(f"  head='{head}'  modifiers={mods}'")
