@@ -159,32 +159,38 @@ def val_modifier_transfer(n_pairs: int = 5):
     """
     if not val_sentences:
         return
-    from chunk_extractor import extract_chunks
+    from chunk_extractor import stream_chunks
     print(f"\n{'='*60}")
     print(f"VALIDATION MODIFIER TRANSFER")
     print(f"{'='*60}")
 
     parsed = []
-    for s in val_sentences[:200]:
-        cs = extract_chunks(s)
-        if cs:
-            parsed.append((s, cs))
+    for chunk in stream_chunks(val_sentences[:200], spacy_batch=64, show_progress=False):
+        parsed.append((chunk.source, chunk))
 
     import random
     rng = random.Random(0)
+    # Group chunks by source sentence
+    by_source = {}
+    for source, chunk in parsed:
+        by_source.setdefault(source, []).append(chunk)
+    sources = list(by_source.keys())
+
     count = 0
     for _ in range(n_pairs * 10):
-        if count >= n_pairs:
+        if count >= n_pairs or len(sources) < 2:
             break
-        (_, chunks_a), (_, chunks_b) = rng.choice(parsed), rng.choice(parsed)
-        chunks_with_mods = [c for c in chunks_a if c.modifiers]
-        if not chunks_with_mods or not chunks_b:
+        src_key = rng.choice(sources)
+        tgt_key = rng.choice(sources)
+        chunks_with_mods = [c for c in by_source[src_key] if c.modifiers]
+        tgt_chunks = by_source[tgt_key]
+        if not chunks_with_mods or not tgt_chunks:
             continue
-        src  = rng.choice(chunks_with_mods)
-        tgt  = rng.choice(chunks_b)
-        mod  = rng.choice(src.modifiers)
-        print(f"\nModifier '{mod}' (from '{src.full_text}') applied to '{tgt.head}':")
-        compare(tgt.head, [[], [mod]])
+        src_chunk = rng.choice(chunks_with_mods)
+        tgt_chunk = rng.choice(tgt_chunks)
+        mod = rng.choice(src_chunk.modifiers)
+        print(f"\nModifier '{mod}' (from '{src_chunk.full_text}') applied to '{tgt_chunk.head}':")
+        compare(tgt_chunk.head, [[], [mod]])
         count += 1
 
 # ---------------------------------------------------------------------------
@@ -202,15 +208,6 @@ roundtrip("man", ["tall", "bearded"])
 roundtrip("field", ["green"])
 roundtrip("sky", ["cloudy"])
 
-roundtrip("object", ["round"])
-roundtrip("object", ["sharp", "metallic"])
-roundtrip("surface", ["rough"])
-roundtrip("surface", ["smooth", "reflective"])
-roundtrip("container", ["large"])
-roundtrip("container", ["sealed", "transparent"])
-roundtrip("structure", ["rigid"])
-roundtrip("structure", ["flexible", "lightweight"])
-
 print(f"\n{'='*60}")
 print("MODIFIER COMPARISON")
 print(f"{'='*60}")
@@ -219,41 +216,6 @@ compare("dog", [[], ["large"], ["small"], ["white"], ["black"], ["large", "white
 compare("person", [[], ["young"], ["old"], ["tall"], ["running"]])
 compare("sky", [[], ["blue"], ["cloudy"], ["dark"], ["clear"]])
 
-compare("object", [
-    [],
-    ["large"],
-    ["small"],
-    ["heavy"],
-    ["fragile"],
-    ["large", "heavy"],
-])
-
-compare("dog", [
-    [],
-    ["large"],
-    ["small"],
-    ["black"],
-    ["white"],
-    ["small", "white"],
-])
-
-compare("surface", [
-    [],
-    ["rough"],
-    ["smooth"],
-    ["wet"],
-    ["sticky"],
-    ["rough", "wet"],
-])
-
-# print("\n" + "=" * 60)
-# print("MODIFIER ORDER CONSISTENCY")
-# print("=" * 60)
-
-# modifier_order_test("object", ["large", "heavy"])
-# modifier_order_test("surface", ["rough", "wet"])
-# modifier_order_test("structure", ["flexible", "lightweight"])
-
 print(f"\n{'='*60}")
 print("INTERPOLATION")
 print(f"{'='*60}")
@@ -261,10 +223,6 @@ print(f"{'='*60}")
 interpolate("dog", ["large"], "dog", ["small"])
 interpolate("sky", ["blue"], "sky", ["cloudy"])
 interpolate("woman", ["young"], "man", ["old"])
-
-interpolate("object", ["small"], "object", ["large"])
-interpolate("surface", ["rough"], "surface", ["smooth"])
-interpolate("structure", ["rigid"], "structure", ["flexible"])
 
 val_roundtrip(n=8)
 val_modifier_transfer(n_pairs=4)
