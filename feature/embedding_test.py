@@ -88,26 +88,46 @@ def test_applicability_cos(mod, noun, reference_vec):
 # METRIC 2 — MAHALANOBIS DISTANCE
 # -----------------------------
 
+from sklearn.decomposition import PCA
+
+PCA_DIMS = 8
+
+# OLD
 def fit_modifier_distribution(mod, nouns):
     vecs = np.stack([diff_avg(mod, n).squeeze().detach().numpy() for n in nouns])
-    mu = vecs.mean(axis=0)
-    cov = np.cov(vecs.T) + np.eye(vecs.shape[1]) * 1e-4
-    return mu, cov
+    pca = PCA(n_components=min(PCA_DIMS, len(nouns) - 1))
+    projected = pca.fit_transform(vecs)
+    mu = projected.mean(axis=0)
+    cov = np.cov(projected.T) + np.eye(projected.shape[1]) * 1e-4
+    return mu, cov, pca
 
-def mahalanobis_dist(mod, noun, mu, cov):
-    v = diff_avg(mod, noun).squeeze().detach().numpy()
-    delta = v - mu
+
+def mahalanobis_loo(mod, noun, all_nouns, pca=None, mu=None, cov=None):
+    train_nouns = [n for n in all_nouns if n != noun]
+    vecs = np.stack([diff_avg(mod, n).squeeze().detach().numpy() for n in train_nouns])
+
+    pca = PCA(n_components=min(PCA_DIMS, len(train_nouns) - 1))
+    projected = pca.fit_transform(vecs)
+    mu = projected.mean(axis=0)
+    cov = np.cov(projected.T) + np.eye(projected.shape[1]) * 1e-4
+
+    # project test vec into the same PCA space
+    test_vec = diff_avg(mod, noun).squeeze().detach().numpy()
+    test_proj = pca.transform(test_vec.reshape(1, -1))[0]
+
+    delta = test_proj - mu
     return float(np.sqrt(delta @ inv(cov) @ delta))
 
 # -----------------------------
 # METRIC 3 — GAUSSIAN LOG-LIKELIHOOD TYPICALITY
 # -----------------------------
 
-def typicality_score(mod, noun, mu, cov):
+def typicality_score(mod, noun, mu, cov, pca):
     v = diff_avg(mod, noun).squeeze().detach().numpy()
+    v_proj = pca.transform(v.reshape(1, -1))[0]
     rv = multivariate_normal(mean=mu, cov=cov, allow_singular=True)
     self_score = rv.logpdf(mu)
-    target_score = rv.logpdf(v)
+    target_score = rv.logpdf(v_proj)
     return round(float(np.exp(target_score - self_score)), 4)
 
 # -----------------------------
@@ -135,11 +155,59 @@ def mlm_compatibility(mod, noun):
 # METRIC 5 — CONTRASTIVE RANK SCORE
 # -----------------------------
 
-def rank_applicability(mod, noun, mu, cov, null_nouns=NULL_NOUNS):
-    target_dist = mahalanobis_dist(mod, noun, mu, cov)
-    null_dists = [mahalanobis_dist(mod, n, mu, cov) for n in null_nouns]
+def rank_applicability(mod, noun, null_nouns=NULL_NOUNS):
+    target_dist = mahalanobis_loo(mod, noun, NOUNS)
+    null_dists = [mahalanobis_loo(mod, n, NOUNS) for n in null_nouns]
     rank = sum(1 for d in null_dists if d > target_dist)
-    return round(rank / len(null_dists), 4)  # 1.0 = most natural, 0.0 = most alien
+    return round(rank / len(null_dists), 4)
+
+
+# -----------------------------
+# COMPOSITE SCORE
+# -----------------------------
+
+# Calibrated from empirical run — adjust if you expand NOUNS/MODIFIERS
+COS_FLOOR = 0.70   # below this = clearly wrong
+COS_CEIL  = 0.94   # above this = perfect (very color ball territory)
+
+# Typicality is inverted: ~0.20 for sensible pairs, ~0.85 for nonsense subjects
+# (1 - typ) gives ~0.80 for sensible, ~0.15 for nonsense — use as a multiplier
+TYP_PENALTY_THRESHOLD = 0.50  # above this = subject is suspicious
+
+def stretched_cos(cs):
+    """
+    Pull the compressed [0.70, 0.94] band into [0.0, 1.0].
+    Anything below floor → 0, above ceil → 1.
+    """
+    return max(0.0, min(1.0, (cs - COS_FLOOR) / (COS_CEIL - COS_FLOOR)))
+
+def mah_to_affinity(mah, scale=1.0):
+    """
+    Soft exponential decay. mah=0 → 1.0, mah=1 → 0.37, mah=2 → 0.14.
+    Scale controls how harshly distance is penalized.
+    """
+    return float(np.exp(-mah / scale))
+
+def base_alignment_score(mod, noun):
+    """cos(phrase, bare noun) — already computed, just expose it"""
+    phrase = embed_phrase(mod, noun)
+    base = embed(noun)
+    return round(cos(phrase, base), 4)
+
+def composite_score(cs, mah, typ, base_align, weights=(0.50, 0.10, 0.15, 0.25)):
+    w_cos, w_mah, w_typ, w_base = weights
+
+    s_cos   = stretched_cos(cs)
+    s_mah   = mah_to_affinity(mah)
+    s_typ   = 1.0 - typ        # inverted: high = bad subject
+    s_base  = base_align       # already in [0,1], no transform needed
+
+    raw = w_cos * s_cos + w_mah * s_mah + w_typ * s_typ + w_base * s_base
+
+    if typ > TYP_PENALTY_THRESHOLD:
+        raw *= 0.5
+
+    return round(raw, 4)
 
 # -----------------------------
 # ORIGINAL TESTS (kept intact)
@@ -266,17 +334,25 @@ for mod, noun in ALL_TEST_PAIRS:
     else:
         dist_key = mod
 
-    mu, cov = distributions[dist_key]
+    mu, cov, pca = distributions[dist_key]  # was: mu, cov = ...
     ref = reference_vecs[dist_key]
 
-    cs  = test_applicability_cos(mod, noun, ref)
-    mah = round(mahalanobis_dist(mod, noun, mu, cov), 3)
-    typ = typicality_score(mod, noun, mu, cov)
+    cs = test_applicability_cos(mod, noun, ref)
+    mah = round(mahalanobis_loo(mod, noun, NOUNS), 3)
+    typ = typicality_score(mod, noun, mu, cov, pca)
+    base_align = base_alignment_score(mod, noun)
     mlm = mlm_compatibility(mod, noun)
-    rnk = rank_applicability(mod, noun, mu, cov)
+    score = composite_score(cs, mah, typ, base_align)
 
+    # header
+    print(f"\n  {'Pair':<30} {'CosSim':>8} {'Mahala':>8} {'Typicty':>8} {'Score':>7}")
+    print(f"  {'-' * 30} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 7}")
+
+    # per pair
+    score = composite_score(cs, mah, typ, base_align)
     label = f"{mod} {noun}"
-    print(f"  {label:<30} {cs:>8} {mah:>8} {typ:>8} {mlm:>10.6f} {rnk:>6}")
+    print(f"  {label:<30} {cs:>8} {mah:>8} {typ:>8} {base_align:>8} {score:>7}")
+    # print(f"  {label:<30} {cs:>8} {mah:>8} {typ:>8} {mlm:>10.6f} {rnk:>6}")
 
 # -------------------------------------------------------
 section("4. RECONSTRUCTION  (cos between recon and actual phrase vec)")
